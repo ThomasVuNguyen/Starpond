@@ -39,8 +39,8 @@ different sensor modality.
 
 ## Constraints
 
-- Solo researcher, limited compute (Mac Mini M2 16GB)
-- Must run locally, no cloud spend
+- Solo researcher, limited compute (Intel i7-8750H, 24GB RAM, GTX 1050 Ti 4GB VRAM)
+- Local compute preferred, but cloud credits available on Cloudrift and Prime Intellect if needed
 - Frozen pretrained backbone — do not train from scratch
 - Keep it simple — this is a proof of concept not a paper implementation
 

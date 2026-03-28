@@ -1,0 +1,21 @@
+# Datasets and Large Media
+WormSwin/
+data/
+dataset_sample/
+
+# Large Files
+*.zip
+*.mp4
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.weights
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+.ipynb_checkpoints/
