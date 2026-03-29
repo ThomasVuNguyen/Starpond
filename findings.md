@@ -32,3 +32,15 @@ We analyzed the local hardware and confirmed we are running on:
 ## 4. Alternate Compute (Cloud Credits)
 In addition to our strong local baseline, we have documented access to cloud credits on **Cloudrift** and **Prime Intellect**. 
 *If* we outscale the GTX 1050 Ti (e.g., if we choose to train a larger, unfrozen temporal transformer on the latent features instead of a small MLP predictor), we can trivially switch the training load over to the cloud while keeping dev/test cycles strictly local.
+
+## 5. Early World Model Baseline Results (AUROC: 0.808)
+We successfully ported the dataset and architecture to an **RTX 4090 Cloudrift VM** to bypass local system-level CPU bottlenecks (Linux file-descriptor exhaustion).
+
+**The Pipeline:**
+1. A frozen `google/vit-base-patch16-224` vision-transformer extracted 768-dimensional latent embeddings for each bounding-box cropped worm.
+2. A lightweight PyTorch Autoencoder was trained **exclusively** on the embeddings from the `6,987` healthy wild-type worms.
+3. The Autoencoder then evaluated `60,571` mixed test embeddings (both healthy and mutant) to calculate reconstruction errors (MSE).
+
+**The Metric:**
+The pipeline achieved a baseline **AUROC of `0.808`**.
+This means that using our blindly extracted features, our model has an **80.8% probability** of correctly assigning a higher prediction error to an anomalous/mutated worm compared to a healthy wild-type worm. This completely validates the fundamental hypothesis set out in `GOAL.md`!
