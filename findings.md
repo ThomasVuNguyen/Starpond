@@ -69,3 +69,9 @@ The initial automated execution block retrieved exactly 27 undamaged Healthy `.h
 
 **Next Implementation Step:** 
 For Phase 3/Grant Proposal preparation, we must scale the pipeline to download all 1,500+ Healthy N2 temporal videos, and substitute the `ViT` backbone inside the temporal predictor for the statistically dominant `DINOv2-Small` backbone from Phase 1.
+
+## 8. Final Proof-of-Concept Compute Cost
+The entire Phase 1 execution (Architectural GPU Sweep across 60k+ images) and Phase 2 Temporal testing (Zenodo data extraction + LSTM trajectory compilation) were completed mathematically on a Cloudrift RTX 4090 virtual machine.
+*   **Total Runtime:** 9 hours
+*   **Hourly Rate:** $0.40 / hr
+*   **Total Grant Hardware Expenditure:** **$3.60**
