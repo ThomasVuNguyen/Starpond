@@ -3,129 +3,126 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from transformers import ViTModel
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, mean_squared_error
 import json
-
 import torch.multiprocessing
+
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 from dataset import get_dataloaders
 
-# 1. SIMPLE AUTOENCODER FOR RECONSTRUCTION
-class AnomalyAutoencoder(nn.Module):
-    def __init__(self, input_dim=768, hidden_dim=64):
+class TemporalPredictor(nn.Module):
+    """
+    Core of the Phase 2 Temporal World Model.
+    Predicts the future latent states (framess 8-15) from past states (frames 0-7).
+    """
+    def __init__(self, embed_dim=768, hidden_dim=256):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, hidden_dim)
-        )
+        self.lstm = nn.LSTM(input_size=embed_dim, hidden_size=hidden_dim, num_layers=2, batch_first=True)
         self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, input_dim)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, embed_dim)
         )
 
     def forward(self, x):
-        z = self.encoder(x)
-        out = self.decoder(z)
-        return out
+        # x is (B, T_past, 768)
+        lstm_out, (hn, cn) = self.lstm(x)
+        # We use the final hidden state to generate a prediction of the future trajectory
+        future_pred = self.decoder(lstm_out[:, -1, :]) # (B, 768)
+        return future_pred
 
-def get_vit_features(loader, vit_model, device):
-    all_features = []
-    all_labels = []
-    
-    vit_model.eval()
+def extract_latents(model, sequences, device):
+    """Convert (B, T, C, H, W) video blocks into (B, T, 768) trajectories."""
+    B, T, C, H, W = sequences.shape
+    # Flatten temporal dimension for batching into standard ViT
+    images = sequences.view(B*T, C, H, W)
     with torch.no_grad():
-        for imgs, labels in tqdm(loader, desc="Extracting ViT features"):
-            imgs = imgs.to(device)
-            # ViT forward pass (pooler_output represents the full image representation)
-            outputs = vit_model(pixel_values=imgs)
-            features = outputs.pooler_output
-            
-            all_features.append(features.cpu())
-            all_labels.append(labels.cpu())
-            
-    return torch.cat(all_features, dim=0), torch.cat(all_labels, dim=0)
+        outputs = model(pixel_values=images)
+        features = outputs.last_hidden_state[:, 0, :] # Extract CLS token
+    return features.view(B, T, -1) # Restore temporal dimension: (B, T, 768)
 
 def main():
+    print("Setting up Phase 2: Latent Temporal World Model...")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Paths
-    base_path = './WormSwin/csb-1_dataset'
+    train_loader, test_loader = get_dataloaders(base_dir='./data/vjepa_openworm', batch_size=4, num_frames=16)
     
-    print("Loading datasets...")
-    # NOTE: The test dataset will have anomalies, the train dataset only healthy normal
-    train_loader, test_loader = get_dataloaders(base_path, batch_size=32)
+    # 1. Base Perception (Frozen Foundation)
+    print("Loading Frozen ViT perception backbone...")
+    vit = ViTModel.from_pretrained("google/vit-base-patch16-224").to(device)
+    vit.eval()
     
-    print("Loading frozen ViT backbone...")
-    vit_model = ViTModel.from_pretrained('google/vit-base-patch16-224')
-    vit_model.to(device)
-    
-    # Extract
-    print("Extracting features for train set...")
-    train_features, train_labels = get_vit_features(train_loader, vit_model, device)
-    
-    print("Extracting features for test set...")
-    test_features, test_labels = get_vit_features(test_loader, vit_model, device)
-    
-    # Train Autoencoder
-    print("Training Anomaly Autoencoder on Healthy Baseline features...")
-    autoencoder = AnomalyAutoencoder(input_dim=768, hidden_dim=64).to(device)
-    optimizer = torch.optim.Adam(autoencoder.parameters(), lr=1e-3)
+    # 2. Temporal Predictive Engine
+    world_model = TemporalPredictor(embed_dim=768).to(device)
+    optimizer = torch.optim.Adam(world_model.parameters(), lr=1e-3)
     criterion = nn.MSELoss()
     
-    # Convert features to dataloaders for training the autoencoder
-    ae_train_dataset = torch.utils.data.TensorDataset(train_features)
-    ae_train_loader = torch.utils.data.DataLoader(ae_train_dataset, batch_size=128, shuffle=True)
+    # 3. Overnight Training Loop (Learn Healthy Movement Trajectories)
+    print("Training Temporal Predictive World Model on Healthy N2 Sequences...")
+    epochs = 40
+    world_model.train()
     
-    autoencoder.train()
-    epochs = 20
-    for epoch in range(epochs):
-        epoch_loss = 0
-        for batch in ae_train_loader:
-            x = batch[0].to(device)
+    for epoch in range(1, epochs+1):
+        total_loss = 0
+        for sequences, _ in train_loader:
+            sequences = sequences.to(device) # (B, 16, 3, 224, 224)
+            # Extrac latent states
+            latents = extract_latents(vit, sequences, device) # (B, 16, 768)
+            
+            # Divide into past and future
+            past_trajectory = latents[:, :8, :]  # Frames 0-7
+            true_future_state = latents[:, 15, :] # Final Frame 15
+            
             optimizer.zero_grad()
-            reconstructed = autoencoder(x)
-            loss = criterion(reconstructed, x)
+            predicted_future = world_model(past_trajectory)
+            
+            loss = criterion(predicted_future, true_future_state)
             loss.backward()
             optimizer.step()
-            epoch_loss += loss.item()
-        if (epoch + 1) % 5 == 0:
-            print(f"Epoch {epoch+1}/{epochs} - Loss: {epoch_loss / len(ae_train_loader):.4f}")
             
-    # Evaluation
-    print("Evaluating Anomaly Model over Test Set...")
-    autoencoder.eval()
-    reconstruction_errors = []
+            total_loss += loss.item()
+        
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch}/{epochs} | Loss: {total_loss / len(train_loader):.4f}")
+            
+    # 4. Anomaly Evaluation
+    print("\nEvaluating Temporal Anomalies in Mutant/Aging worms...")
+    world_model.eval()
+    y_true = []
+    y_scores = []
     
     with torch.no_grad():
-        # process in small chunks from the CPU tensor
-        for i in range(len(test_features)):
-            x = test_features[i:i+1].to(device)
-            reconstructed = autoencoder(x)
-            mse = torch.mean((x - reconstructed) ** 2).item()
-            reconstruction_errors.append(mse)
+        for sequences, labels in tqdm(test_loader, desc="Test Set"):
+            sequences = sequences.to(device)
+            latents = extract_latents(vit, sequences, device)
             
-    # Compute AUROC
-    try:
-        auroc = roc_auc_score(test_labels.numpy(), reconstruction_errors)
-        print(f"FINAL AUROC SCORE: {auroc:.4f}")
-    except ValueError as e:
-        print(f"AUROC calculation failed (possibly missing classes in test set): {e}")
-        auroc = 0.0
-        
-    # Save results
+            past_trajectory = latents[:, :8, :]
+            true_future_state = latents[:, 15, :]
+            
+            predicted_future = world_model(past_trajectory)
+            
+            # Anomaly Score is explicit temporal prediction error
+            mse_errors = torch.mean((predicted_future - true_future_state)**2, dim=1) # (B)
+            
+            for i in range(sequences.shape[0]):
+                y_scores.append(mse_errors[i].item())
+                y_true.append(1 - labels[i].item()) # Invert so Mutants = 1
+                
+    auroc = roc_auc_score(y_true, y_scores)
+    print(f"\nPhase 2 Temporal AUROC: {auroc:.4f}")
+    
     results = {
-        "auroc": auroc,
-        "train_samples": len(train_features),
-        "test_samples": len(test_features)
+        "phase2_temporal_auroc": auroc,
+        "eval_logic": "MSE latent prediction of Future frame from 8-frame past trajectory",
+        "train_samples": len(train_loader.dataset),
+        "test_samples": len(test_loader.dataset)
     }
-    with open('./results.json', 'w') as f:
+    with open('./phase2_results.json', 'w') as f:
         json.dump(results, f)
         
-    print("Pipeline completed successfully! Results saved to results.json")
+    print("\nPhase 2 Success! Results saved.")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -1,109 +1,118 @@
 import os
-import json
-from PIL import Image
+import h5py
+import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
+from PIL import Image
 from torchvision import transforms
 
-class WormSwinDataset(Dataset):
-    def __init__(self, json_path, images_dir, transform=None, mode="train"):
+class TemporalWormDataset(Dataset):
+    def __init__(self, data_dir, num_frames=16, frame_size=(224, 224), is_healthy=True):
         """
-        Args:
-            json_path: Path to coco_annotations JSON
-            images_dir: Path to the images directory
-            transform: torchvision transforms
-            mode: 'train' (only healthy) or 'test' (healthy + anomaly)
+        Loads continuous sequences of worm movement from HDF5 containers.
         """
-        self.images_dir = images_dir
-        self.transform = transform
-        self.mode = mode
-
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-
-        # Map image_id to file_name
-        self.imgid_to_file = {img['id']: img['file_name'] for img in data['images']}
+        self.data_dir = Path(data_dir)
+        self.num_frames = num_frames
+        self.is_healthy = is_healthy
+        self.files = list(self.data_dir.rglob("*.hdf5"))
         
-        # Filter annotations
-        self.samples = []
-        for ann in data['annotations']:
-            img_id = ann['image_id']
-            if img_id not in self.imgid_to_file:
-                continue
-                
-            file_name = self.imgid_to_file[img_id]
-            folder_name = file_name.split('/')[0]
-            
-            # folder format: <age>_<mutation>_<irradiated>_<index>
-            parts = folder_name.split('_')
-            if len(parts) >= 3:
-                mutation = int(parts[1])
-                irradiated = int(parts[2])
-                is_anomaly = (mutation != 0) or (irradiated != 0)
-            else:
-                is_anomaly = False # fallback
-            
-            if mode == "train" and is_anomaly:
-                continue # Train only on healthy
-                
-            self.samples.append({
-                'file_name': file_name,
-                'bbox': ann['bbox'], # [x, y, w, h]
-                'label': 1 if is_anomaly else 0 # 1=Anomaly, 0=Healthy
-            })
-            
+        self.transform = transforms.Compose([
+            transforms.Resize(frame_size),
+            transforms.ToTensor(),
+            # V-JEPA expects ImageNet normalize
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        ])
+
     def __len__(self):
-        return len(self.samples)
+        return len(self.files)
 
     def __getitem__(self, idx):
-        sample = self.samples[idx]
-        img_path = os.path.join(self.images_dir, sample['file_name'])
+        file_path = self.files[idx]
         
-        # Open image
-        image = Image.open(img_path).convert('RGB')
-        
-        # Crop using bounding box [x, y, w, h]
-        x, y, w, h = sample['bbox']
-        
-        # Add some padding around the worm
-        padding = 10
-        left = max(0, x - padding)
-        top = max(0, y - padding)
-        right = min(image.width, x + w + padding)
-        bottom = min(image.height, y + h + padding)
-        
-        image = image.crop((left, top, right, bottom))
-        
-        if self.transform:
-            image = self.transform(image)
-            
-        return image, sample['label']
+        try:
+            with h5py.File(file_path, 'r') as f:
+                # OpenWorm Movement hdf5s usually store the video in 'mask'
+                key = 'mask' if 'mask' in f else 'full_data'
+                video_data = f[key]
+                total_frames = video_data.shape[0]
+                
+                # Fetch a random continuous temporal block
+                if total_frames > self.num_frames:
+                    start_idx = np.random.randint(0, total_frames - self.num_frames)
+                else:
+                    start_idx = 0
+                    
+                frames = []
+                for i in range(self.num_frames):
+                    frame_idx = start_idx + i
+                    # Pad if the video is too short
+                    if frame_idx >= total_frames:
+                        frame_idx = total_frames - 1
+                        
+                    frame_array = video_data[frame_idx]
+                    
+                    # Convert boolean masks or uint8 to standard 0-255 image
+                    if frame_array.dtype == bool:
+                        frame_array = (frame_array * 255).astype(np.uint8)
+                    
+                    # hdf5 mask might be 2D. V-JEPA expects 3-channel RGB.
+                    img = Image.fromarray(frame_array).convert("RGB")
+                    tensor_img = self.transform(img)
+                    frames.append(tensor_img)
+                    
+                # Stack to format: (T, C, H, W)
+                sequence = torch.stack(frames, dim=0)
+                
+                # Label: 0 for anomaly (mutant), 1 for healthy
+                label = 1 if self.is_healthy else 0
+                return sequence, torch.tensor(label, dtype=torch.float32)
+                
+        except Exception as e:
+            # Fallback if a specific HDF5 is corrupt
+            print(f"Error loading {file_path}: {e}")
+            # Return zero tensor sequence as padding
+            return torch.zeros((self.num_frames, 3, 224, 224)), torch.tensor(1.0 if self.is_healthy else 0.0)
 
-def get_dataloaders(base_path, batch_size=32):
-    json_path = os.path.join(base_path, 'coco_annotations', 'all_annotations.json')
-    images_dir = os.path.join(base_path, 'images')
+def get_dataloaders(base_dir='./data/vjepa_openworm', batch_size=4, num_frames=16):
+    """
+    Returns train/test DataLoaders for the temporal prediction model.
+    """
+    healthy_dir = os.path.join(base_dir, 'healthy')
+    anomalous_dir = os.path.join(base_dir, 'anomalous')
     
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                             std=[0.229, 0.224, 0.225])
-    ])
+    # Check if directories exist
+    if not os.path.exists(healthy_dir) or not os.path.exists(anomalous_dir):
+        print(f"Warning: Data directories not found at {base_dir}")
+        return None, None
+        
+    healthy_dataset = TemporalWormDataset(healthy_dir, num_frames=num_frames, is_healthy=True)
+    anomalous_dataset = TemporalWormDataset(anomalous_dir, num_frames=num_frames, is_healthy=False)
     
-    train_dataset = WormSwinDataset(json_path, images_dir, transform=transform, mode="train")
-    test_dataset = WormSwinDataset(json_path, images_dir, transform=transform, mode="test")
+    # Split Healthy dataset into Train (90%) and Test (10%)
+    train_size = int(0.9 * len(healthy_dataset))
+    test_healthy_size = len(healthy_dataset) - train_size
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    # If the dataset is too small, fallback gracefully
+    if train_size == 0 and len(healthy_dataset) > 0:
+        train_dataset = healthy_dataset
+        test_healthy_dataset = []
+    else:
+        train_dataset, test_healthy_dataset = torch.utils.data.random_split(
+            healthy_dataset, [train_size, test_healthy_size]
+        )
+    
+    # Combine test subsets
+    if isinstance(test_healthy_dataset, list) and not test_healthy_dataset:
+        test_dataset = anomalous_dataset
+    else:
+        test_dataset = torch.utils.data.ConcatDataset([test_healthy_dataset, anomalous_dataset])
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    
+    print(f"Temporal Train sequences (Healthy): {len(train_dataset)}")
+    print(f"Temporal Test sequences (Mixed): {len(test_dataset)}")
     
     return train_loader, test_loader
-
-if __name__ == "__main__":
-    base_path = '/root/starpond/WormSwin/csb-1_dataset'
-    train_loader, test_loader = get_dataloaders(base_path, batch_size=16)
-    print(f"Train batches (Healthy only): {len(train_loader)}")
-    print(f"Test batches (Healthy + Anomaly): {len(test_loader)}")
-    
-    for imgs, labels in train_loader:
-        print(f"Train batch shape: {imgs.shape}, Labels type (expect all 0s for train): {torch.unique(labels)}")
-        break

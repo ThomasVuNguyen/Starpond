@@ -1,0 +1,1 @@
+{"phase2_temporal_auroc": 0.515, "eval_logic": "MSE latent prediction of Future frame from 8-frame past trajectory", "train_samples": 27, "test_samples": 204}
